@@ -419,7 +419,8 @@ void setup_wifi() {
   Serial.println(F("WiFi connected"));
   Serial.println("");
   Serial.println(ip);
-  
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
   startCameraServer();
 
 }
@@ -520,5 +521,8 @@ void loop() {
     measureDHT();
     measureEcho();
     measureWater();
+    if(WiFi.status() != WL_CONNECTED){
+        WiFi.reconnect();
+    }
     //vTaskDelay(1000 / portTICK_RATE_MS);
 }
