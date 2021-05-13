@@ -500,7 +500,7 @@ void setup_wifi()
 
   ArduinoOTA.begin();
 
-  //startCameraServer();
+  startCameraServer();
 }
 
 void setup()
