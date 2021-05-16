@@ -464,7 +464,7 @@ void setup_wifi()
   Serial.println("");
   Serial.println(ip);
 
-  WiFi.setAutoReconnect(true);
+  //WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
   ArduinoOTA
@@ -695,14 +695,30 @@ void measureWater()
   }
 }
 
+unsigned long previousWLANMillis = 0;
+unsigned long interval = 30000;
+unsigned long retries = 0;
+#define MAXRETRIES 10
+
 void loop()
 {
   ArduinoOTA.handle();
   measureDHT();
   measureEcho();
   measureWater();
-  if (WiFi.status() != WL_CONNECTED)
-  {
+
+  unsigned long currentMillis = millis();
+  // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
+  if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousWLANMillis >=interval)) {
+    Serial.print(millis());
+    Serial.println("Reconnecting to WiFi...");
+    WiFi.disconnect();
     WiFi.reconnect();
+    previousWLANMillis = currentMillis;
+    retries++;
+    if (retries > MAXRETRIES){
+      retries = 0;
+      ESP.restart();
+    }
   }
 }
