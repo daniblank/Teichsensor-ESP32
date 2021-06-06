@@ -18,8 +18,9 @@
 #include "soc/rtc_cntl_reg.h"
 #include <esp_task_wdt.h>
 
-//3 seconds WDT
-#define WDT_TIMEOUT 3
+//200 seconds WDT
+#define WDT_TIMEOUT 200
+
 #include "time.h"
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 0;
@@ -59,7 +60,7 @@ float airhumidity;
 float airtemperature;
 int waterlevel;
 float watertemperature;
-int retry_counter = 0;
+// int retry_counter = 0;
 #define MAXRETRIES 10
 
 /*
@@ -501,6 +502,7 @@ String sendPhoto() {
     client.stop();
     syslog.logf(LOG_INFO,"Image Saved. Server Message: %s", getBody.c_str());
     Serial.println(getBody);
+    esp_task_wdt_reset();
   }
   else {
     getBody = "sendPhoto: Connection to " + serverName +  " failed.";
@@ -565,12 +567,25 @@ void setup_camera()
   //s->set_framesize(s, FRAMESIZE_QVGA);
 }
 
+
+// Set your Static IP address
+IPAddress local_IP(192, 168, 1, 70);
+// Set your Gateway IP address
+IPAddress gateway(192, 168, 1, 1);
+IPAddress subnet(255, 255, 0, 0);
+IPAddress primaryDNS(8, 8, 8, 8);   //optional
+IPAddress secondaryDNS(8, 8, 4, 4); //optional
+
 void setup_wifi()
 {
     // prevent Wifi connection issues
   // https://github.com/espressif/arduino-esp32/issues/2144
   ESP_ERROR_CHECK(nvs_flash_erase());
   nvs_flash_init();
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure");
+  }
   
   delay(5);
   Serial.println();
@@ -583,13 +598,13 @@ void setup_wifi()
   while ((wifiMulti.run() != WL_CONNECTED)) {
     delay(5000);
     Serial.print(".");
-    retry_counter++;
-    if (retry_counter > MAXRETRIES){
-      ESP.restart();
-    }  
+    // retry_counter++;
+    // if (retry_counter > MAXRETRIES){
+    //   ESP.restart();
+    // }  
   }
   Serial.println(" connected");
-  retry_counter = 0;
+  // retry_counter = 0;
   
   ArduinoOTA
       .onStart([]() {
@@ -640,6 +655,11 @@ void setup()
 {
   pinMode(DHTPIN, INPUT);
   Serial.begin(115200);
+
+  Serial.println("Configuring WDT...");
+  esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
+  esp_task_wdt_add(NULL); //add current thread to WDT watch
+
   sensors.begin();
 
   pinMode(HCSR04TRIGPIN, OUTPUT);
@@ -870,13 +890,15 @@ void sendData(){
   if(httpCode > 0) {
       Serial.printf("[HTTP] POST OK. Return Code %d\n", httpCode);
       syslog.logf(LOG_INFO,"POST OK. Return Code %d", httpCode);
-      retry_counter = 0;
+      esp_task_wdt_reset();
+
+      // retry_counter = 0;
       String payload = http.getString();
       Serial.println(payload);
   } else {
       Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
       syslog.logf(LOG_ERR,"POST failed, error: %s", http.errorToString(httpCode).c_str());
-      retry_counter++;
+      // retry_counter++;
   }
   http.end();
 
@@ -903,29 +925,14 @@ void loop()
       WiFi.disconnect();
       vTaskDelay(5000 / portTICK_RATE_MS);
       WiFi.reconnect();
-      syslog.logf(LOG_ERR,"WiFi restarted. Retry counter= %d", retry_counter);
-      retry_counter++;
+      syslog.log(LOG_ERR,"WiFi restarted.");
+      // syslog.logf(LOG_ERR,"WiFi restarted. Retry counter= %d", retry_counter);
+      // retry_counter++;
     }
-    if (retry_counter > MAXRETRIES){
-      syslog.logf(LOG_CRIT,"MAXRETRIES exceeded. Restarting.");
-      ESP.restart();
-    }     
+    // if (retry_counter > MAXRETRIES){
+    //   syslog.logf(LOG_CRIT,"MAXRETRIES exceeded. Restarting.");
+    //   ESP.restart();
+    // }     
     previousWLANMillis = millis();
   }
-  /*
-  unsigned long currentMillis = millis();
-  // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
-  if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousWLANMillis >=interval)) {
-    Serial.print(millis());
-    Serial.println("Reconnecting to WiFi...");
-    WiFi.disconnect();
-    WiFi.reconnect();
-    previousWLANMillis = currentMillis;
-    retries++;
-    if (retries > MAXRETRIES){
-      retries = 0;
-      ESP.restart();
-    }
-  }
-  */
 }
