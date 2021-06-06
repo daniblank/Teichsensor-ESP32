@@ -1,6 +1,10 @@
 #include <version.h>
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <WiFiMulti.h>
+#include <HTTPClient.h>
 #include <dht.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -10,6 +14,35 @@
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include "nvs_flash.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include <esp_task_wdt.h>
+
+//3 seconds WDT
+#define WDT_TIMEOUT 3
+#include "time.h"
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 0;
+const int   daylightOffset_sec = 3600;
+
+#include <Syslog.h>
+#define SYSLOG_SERVER "192.168.1.100"
+#define SYSLOG_PORT 514
+#define DEVICE_HOSTNAME "pondsensor"
+#define APP_NAME "sensors"
+WiFiUDP udpClient;
+Syslog syslog(udpClient, SYSLOG_SERVER, SYSLOG_PORT, DEVICE_HOSTNAME, APP_NAME, LOG_KERN);  
+
+#include "wlan_params.h"
+IPAddress ip;
+WiFiMulti wifiMulti;
+
+String serverName = "http://192.168.1.100";   
+String imageService = "/upload";     
+String dataService = "/save";     
+const int serverPort = 3456;
+WiFiClient client;
+
 
 #define ONE_WIRE_BUS 13
 #define DHTPIN 2
@@ -26,7 +59,10 @@ float airhumidity;
 float airtemperature;
 int waterlevel;
 float watertemperature;
+int retry_counter = 0;
+#define MAXRETRIES 10
 
+/*
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -371,7 +407,7 @@ void startCameraServer()
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
 }
-
+*/
 #define CAMERA_MODEL_AI_THINKER
 
 #define PWDN_GPIO_NUM 32
@@ -392,8 +428,92 @@ void startCameraServer()
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-void cam_setup()
+String sendPhoto() {
+  String getAll;
+  String getBody;
+
+  camera_fb_t * fb = NULL;
+  fb = esp_camera_fb_get();
+  if(!fb) {
+    Serial.println("Camera capture failed");
+    syslog.logf(LOG_CRIT,"Camera capture failed. Restarting.");
+    delay(1000);
+    ESP.restart();
+  }
+  String serverPath = serverName ;
+  //String serverPath = serverName + ":" + String(serverPort) + dataService;
+  const char* post_host = "192.168.1.100";
+  
+  Serial.println("sendPhoto: Connecting to server: " + serverName);
+
+  if (client.connect(post_host, serverPort)) {
+    Serial.println("sendPhoto: Connection successful!");    
+    String head = "--ImageBoundary\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"esp32-cam.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
+    String tail = "\r\n--ImageBoundary--\r\n";
+
+    uint32_t imageLen = fb->len;
+    uint32_t extraLen = head.length() + tail.length();
+    uint32_t totalLen = imageLen + extraLen;
+  
+    client.println("POST " + imageService + " HTTP/1.1");
+    client.println("Host: " + serverName);
+    client.println("Content-Length: " + String(totalLen));
+    client.println("Content-Type: multipart/form-data; boundary=ImageBoundary");
+    client.println();
+    client.print(head);
+  
+    uint8_t *fbBuf = fb->buf;
+    size_t fbLen = fb->len;
+    for (size_t n=0; n<fbLen; n=n+1024) {
+      if (n+1024 < fbLen) {
+        client.write(fbBuf, 1024);
+        fbBuf += 1024;
+      }
+      else if (fbLen%1024>0) {
+        size_t remainder = fbLen%1024;
+        client.write(fbBuf, remainder);
+      }
+    }   
+    client.print(tail);
+    
+    esp_camera_fb_return(fb);
+    
+    int timoutTimer = 10000;
+    long startTimer = millis();
+    boolean state = false;
+    
+    while ((startTimer + timoutTimer) > millis()) {
+      Serial.print(".");
+      delay(100);      
+      while (client.available()) {
+        char c = client.read();
+        if (c == '\n') {
+          if (getAll.length()==0) { state=true; }
+          getAll = "";
+        }
+        else if (c != '\r') { getAll += String(c); }
+        if (state==true) { getBody += String(c); }
+        startTimer = millis();
+      }
+      if (getBody.length()>0) { break; }
+    }
+    Serial.println();
+    client.stop();
+    syslog.logf(LOG_INFO,"Image Saved. Server Message: %s", getBody.c_str());
+    Serial.println(getBody);
+  }
+  else {
+    getBody = "sendPhoto: Connection to " + serverName +  " failed.";
+    syslog.logf(LOG_ERR,"Saving image failed. Server Message: %s", getBody.c_str());
+    Serial.println(getBody);
+  }
+  return getBody;
+}
+
+
+void setup_camera()
 {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -418,13 +538,13 @@ void cam_setup()
   //init with high specs to pre-allocate larger buffers
   if (psramFound())
   {
-    config.frame_size = FRAMESIZE_UXGA;
+    config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 10;
     config.fb_count = 2;
   }
   else
   {
-    config.frame_size = FRAMESIZE_SVGA;
+    config.frame_size = FRAMESIZE_CIF;
     config.jpeg_quality = 12;
     config.fb_count = 1;
   }
@@ -434,39 +554,43 @@ void cam_setup()
   if (err != ESP_OK)
   {
     Serial.printf("Camera init failed with error 0x%x", err);
+    syslog.logf(LOG_CRIT,"Camera init failed. Error 0x%x", err);
+    delay(1000);
+    ESP.restart();
     return;
   }
 
-  sensor_t *s = esp_camera_sensor_get();
+  //sensor_t *s = esp_camera_sensor_get();
   //drop down frame size for higher initial frame rate
-  s->set_framesize(s, FRAMESIZE_QVGA);
+  //s->set_framesize(s, FRAMESIZE_QVGA);
 }
-
-#include "wlan_params.h"
-IPAddress ip;
 
 void setup_wifi()
 {
-  delay(20);
+    // prevent Wifi connection issues
+  // https://github.com/espressif/arduino-esp32/issues/2144
+  ESP_ERROR_CHECK(nvs_flash_erase());
+  nvs_flash_init();
+  
+  delay(5);
   Serial.println();
   Serial.print("Connecting to ");
   Serial.println(wifi_ssid);
 
-  WiFi.begin(wifi_ssid, wifi_password);
-
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(100);
+  WiFi.mode(WIFI_STA);
+  wifiMulti.addAP(wifi_ssid, wifi_password);
+  Serial.print("Waiting for WiFi to connect...");
+  while ((wifiMulti.run() != WL_CONNECTED)) {
+    delay(5000);
     Serial.print(".");
+    retry_counter++;
+    if (retry_counter > MAXRETRIES){
+      ESP.restart();
+    }  
   }
-  ip = WiFi.localIP();
-  Serial.println(F("WiFi connected"));
-  Serial.println("");
-  Serial.println(ip);
-
-  //WiFi.setAutoReconnect(true);
-  WiFi.persistent(true);
-
+  Serial.println(" connected");
+  retry_counter = 0;
+  
   ArduinoOTA
       .onStart([]() {
         String type;
@@ -474,7 +598,6 @@ void setup_wifi()
           type = "sketch";
         else // U_SPIFFS
           type = "filesystem";
-
         // NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
         Serial.println("Start updating " + type);
       })
@@ -500,16 +623,21 @@ void setup_wifi()
 
   ArduinoOTA.begin();
 
-  startCameraServer();
+  //startCameraServer();
 }
+
+void printLocalTime(){
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return;
+  }
+  Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+}
+
 
 void setup()
 {
-  // prevent Wifi connection issues
-  // https://github.com/espressif/arduino-esp32/issues/2144
-  ESP_ERROR_CHECK(nvs_flash_erase());
-  nvs_flash_init();
-
   pinMode(DHTPIN, INPUT);
   Serial.begin(115200);
   sensors.begin();
@@ -520,11 +648,18 @@ void setup()
   Serial.print("Version:");
   Serial.println(VERSION);
 
-  cam_setup();
-
   vTaskDelay(5000 / portTICK_RATE_MS);
 
   setup_wifi();
+  setup_camera();
+
+  // Init and get the time
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  printLocalTime();
+
+  syslog.logf(LOG_INFO, "Booted Version %s",VERSION);
+  syslog.log(LOG_INFO, "Setup done.");
+
 }
 
 static const unsigned long DHTREFRESH_INTERVAL = 10000; // ms
@@ -559,8 +694,10 @@ void measureDHT()
 // Improved ultrasound measurement
 // based on code by Dragos Calin
 // https://www.intorobotics.com/object-detection-hc-sr04-arduino-millis/
+// Improved sensor fault tolerance by averaging and eliminating zeros
 
-static const unsigned long ECHOREFRESH_INTERVAL = 10000; // ms
+// static const unsigned long ECHOREFRESH_INTERVAL = 10000; // ms, 10 sec
+static const unsigned long ECHOREFRESH_INTERVAL = 10000000; // us, 10 sec
 static unsigned long lastEchoRefreshTime = 0;
 
 unsigned long startTime = 0;
@@ -583,28 +720,42 @@ SensorStates _sensorState = TRIG_LOW;
 
 void startTimer()
 {
-  startTime = millis();
+  //startTime = millis();
+  startTime = micros();
 }
 
-bool isTimerReady(int mSec)
+bool isTimerReady(int uSec)
 {
-  return (millis() - startTime) < mSec;
+  // return (millis() - startTime) < mSec;
+  return (micros() - startTime) < uSec;
+}
+
+static const int NUMMEASUREMENTS = 5;
+int cur_mes = 0;
+float ultrasound_measurements[NUMMEASUREMENTS];
+
+float processMeasurement(float newMeasurement){
+  if (newMeasurement > 50) // 50 uSec ~ 17mm. HC-SR04 detection range:20mm-4500mm
+  {
+    ultrasound_measurements[cur_mes] = newMeasurement * 0.34 / 2;
+    cur_mes = (cur_mes+1) % NUMMEASUREMENTS;
+  }
+  // return average of last measurements
+  int sum = 0;
+  for (int i = 0; i< NUMMEASUREMENTS; i++){
+    sum = sum + ultrasound_measurements[i];
+  }
+  return sum / NUMMEASUREMENTS;
 }
 
 void measureEcho()
 {
   //long duration, distance;
-  if (millis() - lastEchoRefreshTime >= ECHOREFRESH_INTERVAL)
+  // if (millis() - lastEchoRefreshTime >= ECHOREFRESH_INTERVAL)
+  if (micros() - lastEchoRefreshTime >= ECHOREFRESH_INTERVAL)
   {
-    lastEchoRefreshTime = millis();
-  //   digitalWrite(HCSR04TRIGPIN, LOW);
-  //   delayMicroseconds(2);
-  //   digitalWrite(HCSR04TRIGPIN, HIGH);
-  //   delayMicroseconds(10);
-  //   digitalWrite(HCSR04TRIGPIN, LOW);
-  //   duration = pulseIn(HCSR04ECHOPIN, HIGH);
-  //   distance = (duration / 2) / 29.1;
-  //   waterlevel = distance;
+    // lastEchoRefreshTime = millis();
+    lastEchoRefreshTime = micros();
     Serial.print("Water Level: ");
     Serial.println(waterlevel);
   }
@@ -647,7 +798,9 @@ void measureEcho()
            distance = time * speed of sound
            speed of sound is 340 m/s => 0.034 cm/us
         */
-    waterlevel = timeDuration * 0.34 / 2;
+    // waterlevel = timeDuration * 0.34 / 2;
+
+    waterlevel = processMeasurement(timeDuration);
 
     // Serial.print("Distance measured is: ");
     // Serial.print(waterlevel);
@@ -695,10 +848,42 @@ void measureWater()
   }
 }
 
+
+void sendData(){
+  DynamicJsonDocument doc(512);
+  doc["airhumidity"] = airhumidity;
+  doc["airtemperature"] = airtemperature;
+  doc["waterlevel"] = waterlevel;
+  doc["watertemperature"] = watertemperature;
+
+  String httpRequestData;
+  serializeJson(doc, httpRequestData);           
+  Serial.println("sendData: "+httpRequestData);
+
+  String serverPath = serverName + ":" + String(serverPort) + dataService;
+
+  HTTPClient http;
+  http.begin(serverPath);
+  http.addHeader("Content-Type", "application/json");
+  int httpCode = http.POST(httpRequestData);
+
+  if(httpCode > 0) {
+      Serial.printf("[HTTP] POST OK. Return Code %d\n", httpCode);
+      syslog.logf(LOG_INFO,"POST OK. Return Code %d", httpCode);
+      retry_counter = 0;
+      String payload = http.getString();
+      Serial.println(payload);
+  } else {
+      Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+      syslog.logf(LOG_ERR,"POST failed, error: %s", http.errorToString(httpCode).c_str());
+      retry_counter++;
+  }
+  http.end();
+
+}
+
 unsigned long previousWLANMillis = 0;
-unsigned long interval = 30000;
-unsigned long retries = 0;
-#define MAXRETRIES 10
+unsigned long interval = 60000;
 
 void loop()
 {
@@ -707,6 +892,27 @@ void loop()
   measureEcho();
   measureWater();
 
+  if ((millis() - previousWLANMillis) > interval) {
+
+    if((wifiMulti.run() == WL_CONNECTED)) {
+      sendData();
+      sendPhoto();
+    }
+    else {
+      Serial.println("WiFi Disconnected");
+      WiFi.disconnect();
+      vTaskDelay(5000 / portTICK_RATE_MS);
+      WiFi.reconnect();
+      syslog.logf(LOG_ERR,"WiFi restarted. Retry counter= %d", retry_counter);
+      retry_counter++;
+    }
+    if (retry_counter > MAXRETRIES){
+      syslog.logf(LOG_CRIT,"MAXRETRIES exceeded. Restarting.");
+      ESP.restart();
+    }     
+    previousWLANMillis = millis();
+  }
+  /*
   unsigned long currentMillis = millis();
   // if WiFi is down, try reconnecting every CHECK_WIFI_TIME seconds
   if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousWLANMillis >=interval)) {
@@ -721,4 +927,5 @@ void loop()
       ESP.restart();
     }
   }
+  */
 }
